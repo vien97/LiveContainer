@@ -1,15 +1,16 @@
 @import Darwin;
 @import Foundation;
 @import MachO;
-#import "litehook_internal.h"
+#import "../litehook/src/litehook.h"
 #import "LCUtils.h"
+#include "dyld_cache_format.h"
 
 static uint32_t rnd32(uint32_t v, uint32_t r) {
     r--;
     return (v + r) & ~r;
 }
 
-static struct dyld_all_image_infos *_alt_dyld_get_all_image_infos(void) {
+struct dyld_all_image_infos *_alt_dyld_get_all_image_infos(void) {
     static struct dyld_all_image_infos *result;
     if (result) {
         return result;
@@ -53,6 +54,22 @@ static void insertDylibCommand(uint32_t cmd, const char *path, struct mach_heade
     header->sizeofcmds += dylib->cmdsize;
 }
 
+static void replaceDylinkerWithIDDylibCommand(struct dylinker_command* dylinkerCommand, const char *path) {
+    uint32_t size = dylinkerCommand->cmdsize;
+    struct dylib_command* newDylibCommand = (struct dylib_command*)dylinkerCommand;
+    newDylibCommand->cmd = LC_ID_DYLIB;
+
+    newDylibCommand->dylib.name.offset = sizeof(struct dylib_command);
+    newDylibCommand->dylib.compatibility_version = 0x10000;
+    newDylibCommand->dylib.current_version = 0x10000;
+    newDylibCommand->dylib.timestamp = 2;
+    uint32_t nameSize = size - sizeof(struct dylib_command);
+    // we only have 8 bytes to use
+    const char* name = basename((char *)path);
+    strncpy((void *)newDylibCommand + newDylibCommand->dylib.name.offset, name, nameSize);
+    *((char *)newDylibCommand + newDylibCommand->dylib.name.offset + nameSize - 1) = 0;
+}
+
 static void insertRPathCommand(const char *path, struct mach_header_64 *header) {
     struct rpath_command *rpath = (struct rpath_command *)(sizeof(struct mach_header_64) + (void *)header+header->sizeofcmds);
     rpath->cmd = LC_RPATH;
@@ -93,6 +110,7 @@ int LCPatchExecSlice(const char *path, struct mach_header_64 *header, bool doInj
     const char *libCppPath = "/usr/lib/libc++.1.dylib";
     int textSectionOffest = 0;
     struct load_command *command = (struct load_command *)imageHeaderPtr;
+    struct dylinker_command* dylinkerCommand = 0;
     bool codeSignatureCommandFound = false;
     for(int i = 0; i < header->ncmds; i++) {
         if(command->cmd == LC_ID_DYLIB) {
@@ -117,6 +135,8 @@ int LCPatchExecSlice(const char *path, struct mach_header_64 *header, bool doInj
             }
         } else if (command->cmd == LC_CODE_SIGNATURE) {
             codeSignatureCommandFound = true;
+        } else if (command->cmd == LC_LOAD_DYLINKER) {
+            dylinkerCommand = (struct dylinker_command*)command;
         }
         
         command = (struct load_command *)((void *)command + command->cmdsize);
@@ -128,9 +148,16 @@ int LCPatchExecSlice(const char *path, struct mach_header_64 *header, bool doInj
     if(!codeSignatureCommandFound) {
         freeLoadCommandCountLeft -= 0x10;
     }
-    if(!hasDylibCommand && freeLoadCommandCountLeft >= sizeof(struct dylib_command)) {
-        freeLoadCommandCountLeft -= sizeof(struct dylib_command);
-        insertDylibCommand(LC_ID_DYLIB, path, header);
+    
+    int idDylibCommandSize = sizeof(struct dylib_command) + rnd32((uint32_t)strlen(basename((char*)path)) + 1, 8);
+    if(!hasDylibCommand) {
+        if (freeLoadCommandCountLeft >= idDylibCommandSize) {
+            freeLoadCommandCountLeft -= idDylibCommandSize;
+            insertDylibCommand(LC_ID_DYLIB, path, header);
+        } else if (dylinkerCommand) {
+            // #1042 fix: if there's not enough space for LC_ID_DYLIB we resue LC_LOAD_DYLINKER's space for LC_ID_DYLIB
+            replaceDylinkerWithIDDylibCommand(dylinkerCommand, path);
+        }
     }
 
     if (dylibLoaderCommand) {
@@ -151,8 +178,7 @@ int LCPatchExecSlice(const char *path, struct mach_header_64 *header, bool doInj
     // https://github.com/apple-oss-distributions/dyld/blob/93bd81f9d7fcf004fcebcb66ec78983882b41e71/mach_o/Header.cpp#L678
     struct load_command *command2 = (struct load_command *)imageHeaderPtr;
     __block int   depCount = 0;
-    const char*   depPathsBuffer[256];
-    const char**  depPaths = depPathsBuffer;
+    const char**  depPaths = malloc(header->ncmds * sizeof(char*));
     for(int i = 0; i < header->ncmds; i++) {
         switch ( command2->cmd ) {
             case LC_LOAD_DYLIB:
@@ -173,6 +199,7 @@ int LCPatchExecSlice(const char *path, struct mach_header_64 *header, bool doInj
         }
         command2 = (struct load_command *)((void *)command2 + command2->cmdsize);
     }
+    free(depPaths);
     
     return ans;
 }
@@ -277,18 +304,33 @@ void LCChangeMachOUUID(struct mach_header_64 *header) {
 
 const uint8_t* LCGetMachOUUID(struct mach_header_64 *header) {
     if (!header) return NULL;
-
-    // Find load commands
-    const struct load_command* command = (const struct load_command*)(header + 1);
-
-    // Iterate through load commands to find LC_SYMTAB
-    for(uint32_t i = 0; i < header->ncmds; i++) {
-        if(command->cmd == LC_UUID) {
-            return ((const struct uuid_command*)command)->uuid;
+    if(*(uint32_t*)header != 0x646c7964) { // dyld
+        // Find load commands
+        const struct load_command* command = (const struct load_command*)(header + 1);
+        
+        // Iterate through load commands to find LC_SYMTAB
+        for(uint32_t i = 0; i < header->ncmds; i++) {
+            if(command->cmd == LC_UUID) {
+                return ((const struct uuid_command*)command)->uuid;
+            }
+            command = (const struct load_command*)((void *)command + command->cmdsize);
         }
-        command = (const struct load_command*)((void *)command + command->cmdsize);
+        return NULL;
+    } else {
+        struct dyld_cache_header* dsc_header = (struct dyld_cache_header*)header;
+        return dsc_header->uuid;
     }
-    return NULL;
+}
+
+bool LCIsMachOEncrypted(struct mach_header_64 *header) {
+    struct load_command *command = (struct load_command *)(header + 1);
+    for(int i = 0; i < header->ncmds; i++) {
+        if(command->cmd == LC_ENCRYPTION_INFO || command->cmd == LC_ENCRYPTION_INFO_64) {
+            return ((struct encryption_info_command *)command)->cryptid != 0;
+        }
+        command = (struct load_command *)((void *)command + command->cmdsize);
+    }
+    return NO;
 }
 
 uint64_t LCFindSymbolOffset(const char *basePath, const char *symbol) {
@@ -302,7 +344,7 @@ uint64_t LCFindSymbolOffset(const char *basePath, const char *symbol) {
     __block uint64_t offset = 0;
     LCParseMachO(path, true, ^(const char *path, struct mach_header_64 *header, int fd, void *filePtr) {
         if(header->cputype != CPU_TYPE_ARM64) return;
-        void *result = litehook_find_symbol(header, symbol);
+        void *result = litehook_find_symbol_file(header, symbol);
         offset = (uint64_t)result - (uint64_t)header;
     });
     NSCAssert(offset != 0, @"Failed to find symbol %s in %s", symbol, path);

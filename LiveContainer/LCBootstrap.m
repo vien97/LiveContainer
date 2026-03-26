@@ -25,9 +25,12 @@ NSString *lcAppGroupPath;
 NSString* lcAppUrlScheme;
 NSBundle* lcMainBundle;
 NSDictionary* guestAppInfo;
+NSDictionary* guestContainerInfo;
 NSString* lcGuestAppId;
 bool isLiveProcess = false;
 bool isSharedBundle = false;
+bool isSideStore = false;
+bool sideStoreExist = false;
 
 @implementation NSUserDefaults(LiveContainer)
 + (instancetype)lcUserDefaults {
@@ -49,12 +52,23 @@ bool isSharedBundle = false;
     return guestAppInfo;
 }
 
++ (NSDictionary *)guestContainerInfo {
+    return guestContainerInfo;
+}
+
 + (bool)isLiveProcess {
     return isLiveProcess;
 }
 + (bool)isSharedApp {
     return isSharedBundle;
 }
++ (bool)isSideStore {
+    return isSideStore;
+}
++ (bool)sideStoreExist {
+    return sideStoreExist;
+}
+
 + (NSString*)lcGuestAppId {
     return lcGuestAppId;
 }
@@ -88,7 +102,7 @@ static uint64_t rnd64(uint64_t v, uint64_t r) {
     return (v + r) & ~r;
 }
 
-static void overwriteMainCFBundle() {
+void overwriteMainCFBundle(void) {
     // Overwrite CFBundleGetMainBundle
     uint32_t *pc = (uint32_t *)CFBundleGetMainBundle;
     void **mainBundleAddr = 0;
@@ -108,7 +122,7 @@ static void overwriteMainCFBundle() {
     *mainBundleAddr = (__bridge void *)NSBundle.mainBundle._cfBundle;
 }
 
-static void overwriteMainNSBundle(NSBundle *newBundle) {
+void overwriteMainNSBundle(NSBundle *newBundle) {
     // Overwrite NSBundle.mainBundle
     // iOS 16: x19 is _MergedGlobals
     // iOS 17: x19 is _MergedGlobals+4
@@ -135,8 +149,6 @@ static void overwriteMainNSBundle(NSBundle *newBundle) {
 
     assert(![NSBundle.mainBundle.executablePath isEqualToString:oldPath]);
 }
-
-void hook_do_nothing(void) {}
 
 int hook__NSGetExecutablePath_overwriteExecPath(char*** dyldApiInstancePtr, char* newPath, uint32_t* bufsize) {
     assert(dyldApiInstancePtr != 0);
@@ -166,7 +178,7 @@ int hook__NSGetExecutablePath_overwriteExecPath(char*** dyldApiInstancePtr, char
     return 0;
 }
 
-static void overwriteExecPath(const char *newExecPath) {
+void overwriteExecPath(const char *newExecPath) {
     // dyld4 stores executable path in a different place (iOS 15.0 +)
     // https://github.com/apple-oss-distributions/dyld/blob/ce1cc2088ef390df1c48a1648075bbd51c5bbc6a/dyld/DyldAPIs.cpp#L802
     int (*orig__NSGetExecutablePath)(void* dyldPtr, char* buf, uint32_t* bufsize);
@@ -199,7 +211,12 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     if([[lcUserDefaults objectForKey:@"LCWaitForDebugger"] boolValue]) {
         sleep(100);
     }
-    if (!LCSharedUtils.certificatePassword) {
+    if (!LCSharedUtils.certificatePassword && !isSideStore) {
+#if !TARGET_OS_SIMULATOR
+        if(@available(iOS 26.0 ,*))  {
+            return @"JITLess mode is required since iOS 26. Please set it up in settings.";
+        }
+#endif
         // First of all, let's check if we have JIT
         for (int i = 0; i < 10 && !checkJITEnabled(); i++) {
             usleep(1000*100);
@@ -211,12 +228,20 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     }
 
     NSFileManager *fm = NSFileManager.defaultManager;
-    NSString *docPath = [fm URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask]
-        .lastObject.path;
+    NSString *docPath = [NSString stringWithFormat:@"%s/Documents", getenv("LC_HOME_PATH")];
     
     NSURL *appGroupFolder = nil;
     
-    NSString *bundlePath = [NSString stringWithFormat:@"%@/Applications/%@", docPath, selectedApp];
+    NSString *bundlePath = 0;
+    if(!isSideStore) {
+        bundlePath = [NSString stringWithFormat:@"%@/Applications/%@", docPath, selectedApp];
+    } else if (isLiveProcess) {
+        bundlePath = [[NSBundle.mainBundle.bundleURL.URLByDeletingLastPathComponent.URLByDeletingLastPathComponent URLByAppendingPathComponent:@"Frameworks/SideStoreApp.framework"] path];
+    } else {
+        bundlePath = [[NSBundle.mainBundle.bundleURL URLByAppendingPathComponent:@"Frameworks/SideStoreApp.framework"] path];
+    }
+    
+
     guestAppInfo = [NSDictionary dictionaryWithContentsOfFile:[NSString stringWithFormat:@"%@/LCAppInfo.plist", bundlePath]];
 
     // not found locally, let's look for the app in shared folder
@@ -246,7 +271,7 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
                 NSString *expectedBundleId = [entStr substringFromIndex:dotRange.location + 1];
                 if(![infoPlist[@"CFBundleIdentifier"] isEqualToString:expectedBundleId]) {
                     infoPlist[@"CFBundleIdentifier"] = expectedBundleId;
-                    [infoPlist writeToFile:[NSString stringWithFormat:@"%@/Info.plist", bundlePath] atomically:YES];
+                    [infoPlist writeBinToFile:[NSString stringWithFormat:@"%@/Info.plist", bundlePath] atomically:YES];
                 }
             }
         }
@@ -268,8 +293,9 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
         return @"Container not found!";
     }
     
-    if(isSharedBundle) {
-        [LCSharedUtils setContainerUsingByLC:lcAppUrlScheme folderName:dataUUID];
+    if(isLiveProcess && !isSideStore) {
+        lcAppUrlScheme = [lcUserDefaults stringForKey:@"hostUrlScheme"];
+        [lcUserDefaults removeObjectForKey:@"hostUrlScheme"];
     }
     
     NSError *error;
@@ -321,7 +347,44 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
 
     // Overwrite home and tmp path
     NSString *newHomePath = nil;
-    if(isSharedBundle) {
+    NSArray<NSDictionary*>* containers = guestAppInfo[@"LCContainers"];
+    NSURL* bookmarkURL = nil;
+
+    // see if the container contains a bookmark. if so, resolve it and report error upon failure.
+    if(containers && [containers isKindOfClass:NSArray.class]) {
+        for(NSDictionary* container in containers){
+            if(![container isKindOfClass:NSDictionary.class]) {
+                continue;
+            }
+            if([container[@"folderName"] isEqualToString:dataUUID]) {
+                NSData* bookmarkData = container[@"bookmarkData"];
+                if(bookmarkData && [bookmarkData isKindOfClass:NSData.class]) {
+                    // we will be killed by watchdog before timedout, so we set this error beforehand.
+                    [lcUserDefaults setObject:@"Bookmark resolution timed out. Is the data storage offline?" forKey:@"error"];
+                    NSError* err = nil;
+                    BOOL isStale = false;
+                    bookmarkURL = [NSURL URLByResolvingBookmarkData:bookmarkData options:0 relativeToURL:nil bookmarkDataIsStale:&isStale error:&err];
+                    bool access = [bookmarkURL startAccessingSecurityScopedResource];
+                    if(!bookmarkURL || !access) {
+                        return [@"Bookmark resolution failed or unable to access the container. You might need to readd the data storage. %@" stringByAppendingString:err.localizedDescription];
+                    }
+                    [lcUserDefaults removeObjectForKey:@"error"];
+                }
+                break;
+            }
+        }
+    }
+    
+    if(isSideStore) {
+        if(isLiveProcess) {
+            newHomePath = [lcUserDefaults stringForKey:@"specifiedSideStoreContainerPath"];;
+            [lcUserDefaults removeObjectForKey:@"specifiedSideStoreContainerPath"];
+        } else {
+            newHomePath = [docPath stringByAppendingPathComponent:@"SideStore"];
+        }
+    } else if (bookmarkURL) {
+        newHomePath = bookmarkURL.path;
+    } else if(isSharedBundle) {
         newHomePath = [NSString stringWithFormat:@"%@/Data/Application/%@", appGroupFolder.path, dataUUID];
         
     } else {
@@ -366,15 +429,21 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     
     setenv("CFFIXED_USER_HOME", newHomePath.UTF8String, 1);
     setenv("HOME", newHomePath.UTF8String, 1);
-    setenv("TMPDIR", newTmpPath.UTF8String, 1);
+    // we don't change TMP's env in case some apps clear cache by directly deleting the tmp folder,
+    // which if symlinked, the new tmp cannot be recreated (#1040, #1125) or the app may camplain about the tmp folder being a symlimk (#884)
 
     // Setup directories
-    NSArray *dirList = @[@"Library/Caches", @"Documents", @"SystemData"];
+    NSArray *dirList = @[@"Library/Caches", @"Library/Cookies", @"Documents", @"SystemData"];
     for (NSString *dir in dirList) {
         NSString *dirPath = [newHomePath stringByAppendingPathComponent:dir];
         [fm createDirectoryAtPath:dirPath withIntermediateDirectories:YES attributes:nil error:nil];
     }
     
+    NSString* containerInfoPath = [newHomePath stringByAppendingPathComponent:@"LCContainerInfo.plist"];
+    guestContainerInfo = [NSDictionary dictionaryWithContentsOfFile:containerInfoPath];
+    
+    [LCSharedUtils setContainerUsingByLC:lcAppUrlScheme folderName:dataUUID auditToken:0];
+
     // Overwrite NSBundle
     overwriteMainNSBundle(appBundle);
 
@@ -400,18 +469,17 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     
     // hook NSUserDefault before running libraries' initializers
     NUDGuestHooksInit();
-    SecItemGuestHooksInit();
-    NSFMGuestHooksInit();
-    initDead10ccFix();
+    if(!isSideStore) {
+        SecItemGuestHooksInit();
+        NSFMGuestHooksInit();
+        initDead10ccFix();
+    }
     // ignore setting handler from guest app
     litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, NSSetUncaughtExceptionHandler, hook_do_nothing, nil);
     
-    // Preload executable to bypass RT_NOLOAD
-    uint32_t appIndex = _dyld_image_count();
-    appMainImageIndex = appIndex;
-    
-    DyldHooksInit([guestAppInfo[@"hideLiveContainer"] boolValue], [guestAppInfo[@"spoofSDKVersion"] unsignedIntValue]);
-    
+    BOOL hookDlopen = !isSideStore && !isSharedBundle && LCSharedUtils.certificatePassword && isLiveProcess;
+    DyldHooksInit([guestAppInfo[@"hideLiveContainer"] boolValue], hookDlopen, [guestAppInfo[@"spoofSDKVersion"] unsignedIntValue]);
+#if is32BitSupported
     bool is32bit = [guestAppInfo[@"is32bit"] boolValue];
     if(is32bit) {
         if (!isJitEnabled) {
@@ -435,12 +503,14 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
         // maybe need to save selected32bitLayerBundle to static variable?
         appExecPath = strdup(selected32bitLayerBundle.executablePath.UTF8String);
     }
-    
+#endif
     if(![guestAppInfo[@"dontInjectTweakLoader"] boolValue]) {
         tweakLoaderLoaded = true;
     }
     
-    void *appHandle = dlopenBypassingLock(appExecPath, RTLD_LAZY|RTLD_GLOBAL|RTLD_FIRST);
+    // Preload executable to bypass RT_NOLOAD
+    appMainImageIndex = _dyld_image_count();
+    void *appHandle = dlopen_nolock(appExecPath, RTLD_LAZY|RTLD_GLOBAL|RTLD_FIRST);
     appExecutableHandle = appHandle;
     const char *dlerr = dlerror();
     
@@ -460,11 +530,25 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
         dlopen("@loader_path/../TweakLoader.dylib", RTLD_LAZY|RTLD_GLOBAL);
     }
     
+    if(isSideStore) {
+        tweakLoaderLoaded = true;
+        dlopen([lcMainBundle.bundlePath stringByAppendingPathComponent:@"Frameworks/TweakLoader.dylib"].UTF8String, RTLD_LAZY|RTLD_GLOBAL);
+    }
+    
+    if(!isSideStore && sideStoreExist && ![guestAppInfo[@"dontInjectTweakLoader"] boolValue]) {
+        dlopen([lcMainBundle.bundlePath stringByAppendingPathComponent:@"Frameworks/SideStore.framework/SideStore"].UTF8String, RTLD_LAZY);
+    }
+    
     // Fix dynamic properties of some apps
     [NSUserDefaults performSelector:@selector(initialize)];
 
     // Attempt to load the bundle. 32-bit bundle will always fail because of 32-bit main executable, so ignore it
-    if (!is32bit && ![appBundle loadAndReturnError:&error]) {
+    if (
+#if is32BitSupported
+        !is32bit &&
+#endif
+        ![appBundle loadAndReturnError:&error]
+        ) {
         appError = error.localizedDescription;
         NSLog(@"[LCBootstrap] loading bundle failed: %@", error);
         *path = oldPath;
@@ -484,14 +568,17 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     // Go!
     NSLog(@"[LCBootstrap] jumping to main %p", appMain);
     int ret;
+#if is32BitSupported
     if(!is32bit) {
+#endif
         argv[0] = (char *)appExecPath;
         ret = appMain(argc, argv);
+#if is32BitSupported
     } else {
         char *argv32[] = {(char*)appExecPath, (char*)*path, NULL};
         ret = appMain(sizeof(argv32)/sizeof(*argv32) - 1, argv32);
     }
-
+#endif
     return [NSString stringWithFormat:@"App returned from its main function with code %d.", ret];
 }
 
@@ -513,10 +600,25 @@ int LiveContainerMain(int argc, char *argv[]) {
     lcAppUrlScheme = NSBundle.mainBundle.infoDictionary[@"CFBundleURLTypes"][0][@"CFBundleURLSchemes"][0];
     lcAppGroupPath = [[NSFileManager.defaultManager containerURLForSecurityApplicationGroupIdentifier:[NSClassFromString(@"LCSharedUtils") appGroupID]] path];
     isLiveProcess = [lcAppUrlScheme isEqualToString:@"liveprocess"];
-    
+    setenv("LC_HOME_PATH", getenv("HOME"), 0);
 
     NSString *selectedApp = [lcUserDefaults stringForKey:@"selected"];
     NSString *selectedContainer = [lcUserDefaults stringForKey:@"selectedContainer"];
+    if(!selectedApp) {
+        NSString* selectedAppFromLaunchExtension = [lcSharedDefaults stringForKey:@"LCLaunchExtensionBundleID"];
+        
+        if(selectedAppFromLaunchExtension) {
+            NSDate* launchDate = [lcSharedDefaults objectForKey:@"LCLaunchExtensionLaunchDate"];
+            NSTimeInterval secondsSinceDate = [launchDate timeIntervalSinceNow];
+
+            if (secondsSinceDate < 0 && secondsSinceDate >= -3.0) {
+                selectedApp = selectedAppFromLaunchExtension;
+                selectedContainer = [lcSharedDefaults stringForKey:@"LCLaunchExtensionContainerName"];
+            }
+            [lcSharedDefaults removeObjectForKey:@"LCLaunchExtensionBundleID"];
+            [lcSharedDefaults removeObjectForKey:@"LCLaunchExtensionContainerName"];
+        }
+    }
     
     NSString* lastLaunchDataUUID;
     if(!isLiveProcess) {
@@ -531,11 +633,11 @@ int LiveContainerMain(int argc, char *argv[]) {
     if(lastLaunchDataUUID) {
         NSString* lastLaunchType = [lcUserDefaults objectForKey:@"lastLaunchType"];
         NSString* preferencesTo;
-        NSURL *docPathUrl = [NSFileManager.defaultManager URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask].lastObject;
-        if([lastLaunchType isEqualToString:@"Shared"] || isLiveProcess) {
+        if([lastLaunchType isEqualToString:@"Shared"]) {
             preferencesTo = [LCSharedUtils.appGroupPath.path stringByAppendingPathComponent:[NSString stringWithFormat:@"LiveContainer/Data/Application/%@/Library/Preferences", lastLaunchDataUUID]];
         } else {
-            preferencesTo = [docPathUrl.path stringByAppendingPathComponent:[NSString stringWithFormat:@"Data/Application/%@/Library/Preferences", lastLaunchDataUUID]];
+            NSString *docPath = [NSString stringWithFormat:@"%s/Documents", getenv("LC_HOME_PATH")];
+            preferencesTo = [docPath stringByAppendingPathComponent:[NSString stringWithFormat:@"Data/Application/%@/Library/Preferences", lastLaunchDataUUID]];
         }
         // recover preferences
         // this is not needed anymore, it's here for backward competability
@@ -545,14 +647,30 @@ int LiveContainerMain(int argc, char *argv[]) {
             [lcUserDefaults removeObjectForKey:@"lastLaunchType"];
         }
     }
-
+    // in case some weird apps remove the tmp folder
+    [NSFileManager.defaultManager createDirectoryAtPath:@(getenv("TMPDIR")) withIntermediateDirectories:YES attributes:nil error:nil];
+    
     if([selectedApp isEqualToString:@"ui"]) {
         selectedApp = nil;
         [lcUserDefaults removeObjectForKey:@"selected"];
         [lcUserDefaults removeObjectForKey:@"selectedContainer"];
     }
     
-    if(selectedApp && !selectedContainer) {
+    if(isLiveProcess) {
+        sideStoreExist = [NSFileManager.defaultManager fileExistsAtPath:[lcMainBundle.bundlePath stringByAppendingPathComponent:@"../../Frameworks/SideStoreApp.framework"]];
+    } else {
+        sideStoreExist = [NSFileManager.defaultManager fileExistsAtPath:[lcMainBundle.bundlePath stringByAppendingPathComponent:@"Frameworks/SideStoreApp.framework"]];
+    }
+
+    if([lcUserDefaults boolForKey:@"LCOpenSideStore"] || [selectedApp isEqualToString:@"builtinSideStore"]) {
+        if(sideStoreExist) {
+            isSideStore = true;
+        } else {
+            [lcUserDefaults setBool:NO forKey:@"LCOpenSideStore"];
+        }
+    }
+    
+    if(selectedApp && !isSideStore && !selectedContainer) {
         selectedContainer = [LCSharedUtils findDefaultContainerWithBundleId:selectedApp];
     }
     NSString* runningLC = [LCSharedUtils getContainerUsingLCSchemeWithFolderName:selectedContainer];
@@ -562,8 +680,8 @@ int LiveContainerMain(int argc, char *argv[]) {
         [lcUserDefaults removeObjectForKey:@"selected"];
         [lcUserDefaults removeObjectForKey:@"selectedContainer"];
         
-        if([runningLC isEqualToString:@"liveprocess"]) {
-            runningLC = @"livecontainer";
+        if([runningLC hasSuffix:@"liveprocess"]) {
+            runningLC = runningLC.stringByDeletingPathExtension;
         }
         
         NSString* selectedAppBackUp = selectedApp;
@@ -602,7 +720,7 @@ int LiveContainerMain(int argc, char *argv[]) {
 
     }
     
-    if (selectedApp) {
+    if (selectedApp || isSideStore) {
         
         NSString *launchUrl = [lcUserDefaults stringForKey:@"launchAppUrlScheme"];
         [lcUserDefaults removeObjectForKey:@"selected"];
@@ -623,7 +741,6 @@ int LiveContainerMain(int argc, char *argv[]) {
             });
         }
         NSSetUncaughtExceptionHandler(&exceptionHandler);
-        setenv("LC_HOME_PATH", getenv("HOME"), 1);
         NSString *appError = invokeAppMain(selectedApp, selectedContainer, argc, argv);
         if (appError) {
             if(isLiveProcess) {
@@ -642,15 +759,42 @@ int LiveContainerMain(int argc, char *argv[]) {
         }
     }
     
+    if(isLiveProcess) {
+        NSLog(@"LiveProcess should not launch lcui!");
+        return 0;
+    }
+    
+    // put back cookies
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSURL *libraryURL = [fm URLsForDirectory:NSLibraryDirectory inDomains:NSUserDomainMask].firstObject;;
+    NSURL *cookies2URL = [libraryURL URLByAppendingPathComponent:@"Cookies2"];
+    
+    BOOL isDir = NO;
+    if ([fm fileExistsAtPath:cookies2URL.path isDirectory:&isDir] && isDir) {
+        NSError *error = nil;
+        NSURL *cookiesURL  = [libraryURL URLByAppendingPathComponent:@"Cookies"];
+        // Remove old Caches folder if exists
+        if ([fm fileExistsAtPath:cookiesURL.path]) {
+            if ([fm removeItemAtURL:cookiesURL error:&error]) {
+                [fm moveItemAtURL:cookies2URL toURL:cookiesURL error:&error];
+            } else{
+                NSLog(@"Failed to remove old Cookies folder: %@", error);
+            }
+        }
+    }
+    
     void *LiveContainerSwiftUIHandle = dlopen("@executable_path/Frameworks/LiveContainerSwiftUI.framework/LiveContainerSwiftUI", RTLD_LAZY);
     assert(LiveContainerSwiftUIHandle);
+    
+    if(sideStoreExist) {
+        void* sideStoreHandle = dlopen("@executable_path/Frameworks/SideStore.framework/SideStore", RTLD_LAZY);
+    }
 
     if ([lcUserDefaults boolForKey:@"LCLoadTweaksToSelf"]) {
         NSString *tweakFolder = nil;
         if (isSharedBundle) {
             NSURL *appGroupPath = [NSFileManager.defaultManager containerURLForSecurityApplicationGroupIdentifier:[LCSharedUtils appGroupID]];
-            NSURL *appGroupFolder = [appGroupPath URLByAppendingPathComponent:@"LiveContainer"];
-            tweakFolder = [appGroupFolder.path stringByAppendingPathComponent:@"Tweaks"];
+            tweakFolder = [appGroupPath.path stringByAppendingPathComponent:@"LiveContainer/Tweaks"];
         } else {
             NSString *docPath = [NSFileManager.defaultManager URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask].lastObject.path;
             tweakFolder = [docPath stringByAppendingPathComponent:@"Tweaks"];

@@ -31,10 +31,13 @@ API_AVAILABLE(ios(16.0))
 @property(nonatomic) CGFloat scaleRatio;
 @property(nonatomic) UIView* contentView;
 @property(nonatomic) _UIScenePresenter *presenter;
+@property(nonatomic) UIMutableApplicationSceneSettings *settings;
 - (instancetype)initWithBundleId:(NSString*)bundleId dataUUID:(NSString*)dataUUID delegate:(id<AppSceneViewControllerDelegate>)delegate;
 - (void)setBackgroundNotificationEnabled:(bool)enabled;
 - (void)updateFrameWithSettingsBlock:(void (^)(UIMutableApplicationSceneSettings *settings))block;
 - (void)appTerminationCleanUp;
 - (void)terminate;
+- (void)openURLScheme:(NSString *)urlString;
+- (void)handleStatusBarTapAction:(UIAction *)action;
 @end
 

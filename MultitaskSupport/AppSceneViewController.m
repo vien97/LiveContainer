@@ -7,9 +7,11 @@
 #import "AppSceneViewController.h"
 #import "DecoratedAppSceneViewController.h"
 #import "LiveContainerSwiftUI-Swift.h"
-#import "../LiveContainerSwiftUI/LCUtils.h"
+#import "../LiveContainerSwiftUI/Utilities/LCUtils.h"
 #import "PiPManager.h"
 #import "Localization.h"
+#import "LCSharedUtils.h"
+#import "utils.h"
 
 @interface AppSceneViewController()
 @property int resizeDebounceToken;
@@ -20,7 +22,6 @@
 
 @interface AppSceneViewController()
 @property(nonatomic) UIWindowScene *hostScene;
-@property(nonatomic) UIMutableApplicationSceneSettings *settings;
 @property(nonatomic) NSString *sceneID;
 @property(nonatomic) NSExtension* extension;
 @property(nonatomic) bool isAppTerminationCleanUpCalled;
@@ -39,25 +40,46 @@
     self.bundleId = bundleId;
     self.scaleRatio = 1.0;
     self.isAppTerminationCleanUpCalled = false;
+    self.settings = [UIMutableApplicationSceneSettings new];
     // init extension
-    NSBundle *liveProcessBundle = [NSBundle bundleWithPath:[NSBundle.mainBundle.builtInPlugInsPath stringByAppendingPathComponent:@"LiveProcess.appex"]];
-    if(!liveProcessBundle) {
-        [delegate appSceneVC:self didInitializeWithError:[NSError errorWithDomain:@"LiveProcess" code:2 userInfo:@{NSLocalizedDescriptionKey: @"LiveProcess extension not found. Please reinstall LiveContainer and select Keep Extensions"}]];
-        return nil;
-    }
-    
     NSError* error = nil;
-    _extension = [NSExtension extensionWithIdentifier:liveProcessBundle.bundleIdentifier error:&error];
+    _extension = [NSExtension extensionWithIdentifier:LCUtils.liveProcessBundleIdentifier error:&error];
     if(error) {
         [delegate appSceneVC:self didInitializeWithError:error];
         return nil;
     }
     _extension.preferredLanguages = @[];
+    
     NSExtensionItem *item = [NSExtensionItem new];
-    item.userInfo = @{
+    NSMutableArray* bookmarks = [NSMutableArray array];
+    NSMutableDictionary *userInfo = @{
+        @"hostUrlScheme": NSUserDefaults.lcAppUrlScheme,
         @"selected": _bundleId,
-        @"selectedContainer": _dataUUID
-    };
+        @"selectedContainer": _dataUUID,
+        @"bookmarks": bookmarks,
+        @"lcHomePath": NSHomeDirectory(),
+    }.mutableCopy;
+    
+    NSURL *docURL = [NSFileManager.defaultManager URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask].lastObject;
+    if ([NSUserDefaults.standardUserDefaults boolForKey:@"LCSharePrivateDataWithLiveProcess"]) {
+        NSData* bookmarkData = [docURL bookmarkDataWithOptions:(1<<11) includingResourceValuesForKeys:0 relativeToURL:0 error:0];
+        [bookmarks addObject:bookmarkData];
+    } else {
+        bool isSharedApp = false;
+        NSBundle* bundle = [LCSharedUtils findBundleWithBundleId:bundleId isSharedAppOut:&isSharedApp];
+        // when mutlitask with private app, we can restrict its sandbox to only its own container
+        if (!isSharedApp) {
+            NSURL *dataURL = [docURL URLByAppendingPathComponent:[NSString stringWithFormat:@"Data/Application/%@", dataUUID]];
+            NSURL *tweaksURL = [docURL URLByAppendingPathComponent:@"Tweaks"];
+            [bookmarks addObject:[bundle.bundleURL bookmarkDataWithOptions:(1<<11) includingResourceValuesForKeys:0 relativeToURL:0 error:0]];
+            NSData* containerBookmark = [dataURL bookmarkDataWithOptions:(1<<11) includingResourceValuesForKeys:0 relativeToURL:0 error:0];
+            if(containerBookmark) {
+                [bookmarks addObject:containerBookmark];
+            }
+            [bookmarks addObject:[tweaksURL bookmarkDataWithOptions:(1<<11) includingResourceValuesForKeys:0 relativeToURL:0 error:0]];
+        }
+    }
+    item.userInfo = userInfo;
     
     __weak typeof(self) weakSelf = self;
     [_extension setRequestCancellationBlock:^(NSUUID *uuid, NSError *error) {
@@ -81,8 +103,10 @@
             [delegate appSceneVC:self didInitializeWithError:error];
         }
     }];
+    
+    
 
-    _isNativeWindow = [[[NSUserDefaults alloc] initWithSuiteName:[LCUtils appGroupID]] integerForKey:@"LCMultitaskMode" ] == 1;
+    _isNativeWindow = [NSUserDefaults.lcSharedDefaults integerForKey:@"LCMultitaskMode" ] == 1;
 
     return self;
 }
@@ -95,7 +119,7 @@
     RBSProcessHandle* processHandle = [PrivClass(RBSProcessHandle) handleForPredicate:predicate error:nil];
     [manager registerProcessForAuditToken:processHandle.auditToken];
     // NSString *identifier = [NSString stringWithFormat:@"sceneID:%@-%@", bundleID, @"default"];
-    self.sceneID = [NSString stringWithFormat:@"sceneID:%@-%@", @"LiveProcess", NSUUID.UUID.UUIDString];
+    self.sceneID = [NSString stringWithFormat:@"sceneID:%@-%@", @"LiveProcess", self.dataUUID];
     
     FBSMutableSceneDefinition *definition = [PrivClass(FBSMutableSceneDefinition) definition];
     definition.identity = [PrivClass(FBSSceneIdentity) identityForIdentifier:self.sceneID];
@@ -103,7 +127,7 @@
     definition.specification = [UIApplicationSceneSpecification specification];
     FBSMutableSceneParameters *parameters = [PrivClass(FBSMutableSceneParameters) parametersForSpecification:definition.specification];
     
-    UIMutableApplicationSceneSettings *settings = [UIMutableApplicationSceneSettings new];
+    UIMutableApplicationSceneSettings *settings = self.settings;
     settings.canShowAlerts = YES;
     settings.cornerRadiusConfiguration = [[PrivClass(BSCornerRadiusConfiguration) alloc] initWithTopLeft:self.view.layer.cornerRadius bottomLeft:self.view.layer.cornerRadius bottomRight:self.view.layer.cornerRadius topRight:self.view.layer.cornerRadius];
     settings.displayConfiguration = UIScreen.mainScreen.displayConfiguration;
@@ -118,21 +142,16 @@
     }
     //settings.interruptionPolicy = 2; // reconnect
     settings.level = 1;
-    settings.persistenceIdentifier = NSUUID.UUID.UUIDString;
+    settings.persistenceIdentifier = self.dataUUID;
     if(self.isNativeWindow) {
         UIEdgeInsets defaultInsets = self.view.window.safeAreaInsets;
         settings.peripheryInsets = defaultInsets;
         settings.safeAreaInsetsPortrait = defaultInsets;
-    } else {
-        // it seems some apps don't honor these settings so we don't cover the top of the app
-        settings.peripheryInsets = UIEdgeInsetsMake(0, 0, 0, 0);
-        settings.safeAreaInsetsPortrait = UIEdgeInsetsMake(0, 0, 0, 0);
     }
     
     settings.statusBarDisabled = !self.isNativeWindow;
     //settings.previewMaximumSize =
     //settings.deviceOrientationEventsEnabled = YES;
-    self.settings = settings;
     parameters.settings = settings;
     
     UIMutableApplicationSceneClientSettings *clientSettings = [UIMutableApplicationSceneClientSettings new];
@@ -147,6 +166,13 @@
         context.appearanceStyle = 2;
     }];
     [self.presenter activate];
+    
+    // If we have a staging URL scheme, pass it now
+    NSString *launchUrl = [NSUserDefaults.standardUserDefaults stringForKey:@"launchAppUrlScheme"];
+    if(launchUrl) {
+        [NSUserDefaults.standardUserDefaults removeObjectForKey:@"launchAppUrlScheme"];
+        [self openURLScheme:launchUrl];
+    }
     
     __weak typeof(self) weakSelf = self;
     [self.extension setRequestInterruptionBlock:^(NSUUID *uuid) {
@@ -228,7 +254,6 @@
     _isAppTerminationCleanUpCalled = true;
     dispatch_async(dispatch_get_main_queue(), ^{
         if(self.sceneID) {
-            [self.view.window.windowScene _unregisterSettingsDiffActionArrayForKey:self.sceneID];
             [[PrivClass(FBSceneManager) sharedInstance] destroyScene:self.sceneID withTransitionContext:nil];
         }
         if(self.presenter){
@@ -238,7 +263,6 @@
         }
         
         [self.delegate appSceneVCAppDidExit:self];
-        self.delegate = nil;
         [MultitaskManager unregisterMultitaskContainerWithContainer:self.dataUUID];
     });
 }
@@ -247,10 +271,41 @@
     if(enabled) {
         // Re-add UIApplicationDidEnterBackgroundNotification
         [NSNotificationCenter.defaultCenter addObserver:self.extension selector:@selector(_hostDidEnterBackgroundNote:) name:UIApplicationDidEnterBackgroundNotification object:UIApplication.sharedApplication];
+        [NSNotificationCenter.defaultCenter addObserver:self.extension selector:@selector(_hostWillResignActiveNote:) name:UIApplicationWillResignActiveNotification object:UIApplication.sharedApplication];
     } else {
         // Remove UIApplicationDidEnterBackgroundNotification so apps like YouTube can continue playing video
         [NSNotificationCenter.defaultCenter removeObserver:self.extension name:UIApplicationDidEnterBackgroundNotification object:UIApplication.sharedApplication];
+        [NSNotificationCenter.defaultCenter removeObserver:self.extension name:UIApplicationWillResignActiveNotification object:UIApplication.sharedApplication];
     }
+}
+
+- (void)viewDidMoveToWindow:(UIWindow *)newWindow shouldAppearOrDisappear:(BOOL)appear {
+    [super viewDidMoveToWindow:newWindow shouldAppearOrDisappear:appear];
+    if(!newWindow) {
+        if(self.sceneID) {
+            [self.view.window.windowScene _unregisterSettingsDiffActionArrayForKey:self.sceneID];
+        }
+        self.delegate = nil;
+    }
+}
+
+- (void)openURLScheme:(NSString *)urlString {
+    [self.presenter.scene updateSettingsWithTransitionBlock:^(id settings) {
+        // pull from UserDefaults.standard.setValue(launchURLStr, forKey: "launchAppUrlScheme")
+        UIApplicationSceneTransitionContext *context = [UIApplicationSceneTransitionContext new];
+        NSURL *url = [NSURL URLWithString:urlString];
+        context.payload = @{UIApplicationLaunchOptionsURLKey: urlString};
+        context.actions = [NSSet setWithObject:[[UIOpenURLAction alloc] initWithURL:url]];
+        return context;
+    }];
+}
+
+- (void)handleStatusBarTapAction:(UIAction *)action {
+    [self.presenter.scene updateSettingsWithTransitionBlock:^(id settings) {
+        UIApplicationSceneTransitionContext *context = [UIApplicationSceneTransitionContext new];
+        context.actions = [NSSet setWithObject:action];
+        return context;
+    }];
 }
 
 @end
